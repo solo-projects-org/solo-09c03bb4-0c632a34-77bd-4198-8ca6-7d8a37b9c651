@@ -13,7 +13,10 @@ from fastapi.templating import Jinja2Templates
 
 from .ais import MAX_SPEED_KNOTS
 from .db import connect, init_db, read_tx
-from .store import Store, UploadError
+from .store import CursorError, Store, UploadError
+
+DEFAULT_SYNC_LIMIT = 100
+MAX_SYNC_LIMIT = 1000
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("AIS_DATA_DIR", BASE_DIR.parent / "data"))
@@ -221,9 +224,13 @@ def vessel_detail(request: Request, mmsi: str):
     conn = _conn()
     try:
         with read_tx(conn):
+            store = _store(conn)
             vessel = conn.execute("SELECT * FROM vessels WHERE mmsi = ?", (mmsi,)).fetchone()
             if vessel is None:
                 raise HTTPException(status_code=404, detail="没有该船的已发布数据")
+            # A cursor bound to the content rendered on this page: the same
+            # token continues from exactly this track on the sync endpoint.
+            cursor, _ = store.issue_cursor(conn, mmsi)
             version = vessel["version"]
             points = conn.execute(
                 "SELECT * FROM track_points WHERE mmsi = ? AND version = ? ORDER BY seq",
@@ -250,6 +257,15 @@ def vessel_detail(request: Request, mmsi: str):
                 """,
                 (mmsi,),
             ).fetchall()
+            revisions = conn.execute(
+                """
+                SELECT vv.version, vv.batch_id, vv.change_count, vv.created_at,
+                       b.filename AS batch_filename
+                FROM vessel_versions vv JOIN batches b ON b.id = vv.batch_id
+                WHERE vv.mmsi = ? ORDER BY vv.version DESC LIMIT 10
+                """,
+                (mmsi,),
+            ).fetchall()
     finally:
         conn.close()
     return _render(
@@ -259,7 +275,9 @@ def vessel_detail(request: Request, mmsi: str):
         points=points,
         isolated=isolated,
         batches=batches,
+        revisions=revisions,
         version=version,
+        cursor=cursor,
     )
 
 
@@ -268,6 +286,7 @@ def vessel_track(request: Request, mmsi: str):
     conn = _conn()
     try:
         with read_tx(conn):
+            store = _store(conn)
             vessel = conn.execute("SELECT * FROM vessels WHERE mmsi = ?", (mmsi,)).fetchone()
             if vessel is None:
                 raise HTTPException(status_code=404, detail="没有该船的已发布数据")
@@ -277,6 +296,9 @@ def vessel_track(request: Request, mmsi: str):
                 (mmsi, version),
             ).fetchall()
             data = _render_track_csv(vessel["mmsi"], points)
+            # The cursor is content-bound: replaying the change feed from it
+            # on top of exactly this download always reproduces the live track.
+            cursor, _ = store.issue_cursor(conn, mmsi)
     finally:
         conn.close()
     return StreamingResponse(
@@ -285,8 +307,178 @@ def vessel_track(request: Request, mmsi: str):
         headers={
             "Content-Disposition": _attachment(f"track_{vessel['mmsi']}.csv"),
             "X-Track-Version": str(version),
+            "X-Sync-Cursor": cursor,
+            "Link": f'</vessels/{mmsi}/sync?cursor={cursor}>; rel="changes"',
         },
     )
+
+
+@app.get("/vessels/{mmsi}/cursor")
+def vessel_cursor(mmsi: str):
+    """Return a fresh cursor bound to the currently published track."""
+
+    conn = _conn()
+    try:
+        with read_tx(conn):
+            store = _store(conn)
+            try:
+                token, version = store.issue_cursor(conn, mmsi)
+            except CursorError as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+    finally:
+        conn.close()
+    return {
+        "mmsi": mmsi,
+        "version": version,
+        "cursor": token,
+        "sync_url": f"/vessels/{mmsi}/sync?cursor={token}",
+    }
+
+
+@app.get("/vessels/{mmsi}/sync")
+def vessel_sync(request: Request, mmsi: str, cursor: str | None = None, limit: int = DEFAULT_SYNC_LIMIT):
+    """Incremental change feed, paged at whole-version boundaries.
+
+    Without ``cursor`` the full history of ``add`` changes is returned (the
+    equivalent of the current track for a new offline library); with a cursor
+    only revisions newer than the cursor's version are returned.  Each
+    revision is one recomputation published by one batch and is never split
+    across pages.  ``next_cursor`` resumes the feed and survives restarts.
+    """
+
+    if limit < 1:
+        raise HTTPException(status_code=400, detail="limit 必须为正整数")
+    limit = min(limit, MAX_SYNC_LIMIT)
+
+    conn = _conn()
+    try:
+        with read_tx(conn):
+            store = _store(conn)
+            try:
+                if cursor is None:
+                    since = 0
+                else:
+                    cursor_mmsi, since = store.resolve_cursor(conn, cursor)
+                    if cursor_mmsi != mmsi:
+                        raise CursorError(400, "游标属于另一艘船，不能用于本船同步")
+                feed = store.read_changes(conn, mmsi, since, limit)
+            except CursorError as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+            wants_html = _wants_html(request)
+            if not wants_html:
+                payload = _render_sync_csv(mmsi, feed)
+            else:
+                payload = None
+    finally:
+        conn.close()
+
+    headers = {
+        "X-Sync-From-Version": str(feed["from_version"]),
+        "X-Sync-Last-Version": str(feed["last_version"]),
+        "X-Sync-Current-Version": str(feed["current_version"]),
+        "X-Sync-Next-Cursor": feed["next_cursor"],
+        "X-Sync-Has-More": "1" if feed["has_more"] else "0",
+    }
+    if wants_html:
+        headers["Content-Type"] = "text/html; charset=utf-8"
+        return _render(request, "sync.html", feed=feed, cursor=cursor, limit=limit)
+    next_url = (
+        f"/vessels/{mmsi}/sync?cursor={feed['next_cursor']}&limit={limit}"
+        if feed["has_more"]
+        else None
+    )
+    if next_url:
+        headers["Link"] = f'<{next_url}>; rel="next"'
+    return StreamingResponse(
+        io.BytesIO(payload),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            **headers,
+            "Content-Disposition": _attachment(f"sync_{mmsi}_v{feed['last_version']}.csv"),
+        },
+    )
+
+
+def _wants_html(request: Request) -> bool:
+    """True only when the client explicitly prefers HTML over generic data.
+
+    A bare ``*/*`` (curl, TestClient defaults, programmatic sync jobs) gets
+    the CSV feed; a browser's ``text/html`` Accept gets the revision page.
+    When both are present their quality values decide (e.g.
+    ``*/*;q=0.5, text/html`` still prefers HTML).
+    """
+
+    accept = request.headers.get("accept", "")
+    if not accept:
+        return False
+    html_q = -1.0
+    generic_q = 0.0
+    for part in accept.split(","):
+        bits = part.split(";")
+        media = bits[0].strip().lower()
+        q = 1.0
+        for bit in bits[1:]:
+            bit = bit.strip()
+            if bit.startswith("q="):
+                try:
+                    q = float(bit[2:])
+                except ValueError:
+                    q = 1.0
+        if media == "text/html":
+            html_q = q
+        elif media in ("*/*", "application/json", "text/csv", "application/csv"):
+            generic_q = max(generic_q, q)
+    if html_q < 0.0:
+        return False
+    return html_q >= generic_q
+
+
+def _render_sync_csv(mmsi: str, feed: dict) -> bytes:
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(
+        [
+            "mmsi",
+            "version",
+            "seq",
+            "op",
+            "utc_seconds",
+            "utc_iso",
+            "lat",
+            "lon",
+            "speed_knots",
+            "station",
+            "raw_row_id",
+            "point_batch_id",
+            "source_batch_id",
+            "source_batch_filename",
+            "source_batch_sha256",
+        ]
+    )
+    import datetime
+
+    for revision in feed["revisions"]:
+        for c in revision["changes"]:
+            writer.writerow(
+                [
+                    mmsi,
+                    revision["version"],
+                    c["seq"],
+                    c["op"],
+                    c["utc"],
+                    datetime.datetime.fromtimestamp(c["utc"], datetime.timezone.utc).isoformat(),
+                    "" if c["lat"] is None else f"{c['lat']:.6f}",
+                    "" if c["lon"] is None else f"{c['lon']:.6f}",
+                    "" if c["speed_knots"] is None else f"{c['speed_knots']:.2f}",
+                    c["station"] or "",
+                    "" if c["raw_row_id"] is None else c["raw_row_id"],
+                    c["point_batch_id"] or "",
+                    revision["batch_id"],
+                    revision["batch_filename"],
+                    revision["batch_sha256"],
+                ]
+            )
+    return buf.getvalue().encode("utf-8")
 
 
 def _render_track_csv(mmsi: str, points) -> bytes:

@@ -32,17 +32,109 @@ def main() -> int:
         )
         print(f"batch2: accepted={b2.accepted} rejected={b2.rejected} vessels={b2.vessels}")
 
+        # --- incremental sync: remember a cursor before the next publication ---
+        cursor_v6 = store.encode_cursor("413000006", 2)
+        live_v6_before = {
+            r["utc"]: dict(r)
+            for r in conn.execute(
+                "SELECT utc, raw_row_id FROM track_points WHERE mmsi='413000006' AND version=2"
+            )
+        }
+
+        b3 = store.publish(
+            "batch3_incremental.csv",
+            Path("samples/batch3_incremental.csv").read_bytes(),
+        )
+        print(f"batch3: accepted={b3.accepted} rejected={b3.rejected} vessels={b3.vessels}")
+
+        # A no-op replay (identical observations) must not mint a version or
+        # append any change, and must leave every cursor exactly current.
+        version_before = conn.execute(
+            "SELECT version FROM vessels WHERE mmsi='413000006'"
+        ).fetchone()["version"]
+        changes_before = conn.execute(
+            "SELECT COUNT(*) c FROM track_changes WHERE mmsi='413000006'"
+        ).fetchone()["c"]
+        store.publish(
+            "batch3_replay.csv",
+            Path("samples/batch3_incremental.csv").read_bytes(),
+        )
+        version_after = conn.execute(
+            "SELECT version FROM vessels WHERE mmsi='413000006'"
+        ).fetchone()["version"]
+        changes_after = conn.execute(
+            "SELECT COUNT(*) c FROM track_changes WHERE mmsi='413000006'"
+        ).fetchone()["c"]
+        assert version_before == version_after, "no-op replay advanced a vessel version"
+        assert changes_before == changes_after, "no-op replay appended changes"
+        print(f"no-op replay: 413000006 stays at v{version_after} with {changes_after} changes")
+
+        # --- read the change feed from the old cursor, one revision per page ---
+        feed = store.read_changes(conn, "413000006", 2, max_versions=100)
+        assert len(feed["revisions"]) == 1, "expected exactly one new revision"
+        revision = feed["revisions"][0]
+        ops = [(c["op"], c["utc"]) for c in revision["changes"]]
+        print(f"413000006 v{revision['version']} changes: {ops}")
+        assert ops == [("add", 1767229260)], "batch3 should append one trusted point"
+        assert feed["has_more"] is False
+        assert store.decode_cursor(feed["next_cursor"]) == ("413000006", revision["version"])
+
+        # Replaying the feed on top of the cursor snapshot yields the live track.
+        applied = dict(live_v6_before)
+        for c in revision["changes"]:
+            if c["op"] == "add":
+                applied[c["utc"]] = c
+            else:
+                applied.pop(c["utc"], None)
+        live_v6_after = {
+            r["utc"]: dict(r)
+            for r in conn.execute(
+                "SELECT utc, raw_row_id FROM track_points WHERE mmsi='413000006' "
+                "AND version=(SELECT version FROM vessels WHERE mmsi='413000006')"
+            )
+        }
+        assert set(applied) == set(live_v6_after), "replayed feed does not match live track"
+        print("incremental replay of 413000006 converges on the live track")
+
+        # The old cursor is still resolvable and restarts need no special case.
+        assert store.decode_cursor(cursor_v6) == ("413000006", 2)
+        assert store.read_changes(conn, "413000006", 2, 1)["revisions"][0]["version"] == 3
+
+        # A late conflicting telegram retracts an earlier trusted point: the
+        # revision then carries a remove, proving the offline library learns
+        # about deletions without re-downloading the whole vessel.
+        store.publish(
+            "batch4_conflict.csv",
+            (
+                "station,mmsi,utc,lat,lon\n"
+                "HK02,413000009,1767225600,23.900000,115.900000\n"
+            ).encode(),
+        )
+        conflict_feed = store.read_changes(conn, "413000009", 1, 100)
+        conflict_ops = [(c["op"], c["utc"]) for c in conflict_feed["revisions"][0]["changes"]]
+        print(f"413000009 conflict revision changes: {conflict_ops}")
+        assert ("remove", 1767225600) in conflict_ops, "conflict retraction missing"
+
+        # A brand-new vessel gets its own v1 revision made only of additions.
+        feed_v9 = store.read_changes(conn, "413000009", 0, 100)
+        assert all(c["op"] == "add" for c in feed_v9["revisions"][0]["changes"])
+        print("new vessel 413000009 starts from an all-add first revision")
+
         flipped = conn.execute(
-            "SELECT isolated_count FROM vessels WHERE mmsi = '413000006'"
+            "SELECT isolated_count, version FROM vessels WHERE mmsi = '413000006'"
         ).fetchone()
         isolated_416 = conn.execute(
             """
             SELECT COUNT(*) c FROM verdicts v
-            WHERE v.mmsi = '413000006' AND v.version = 2 AND v.status = 'isolated'
+            WHERE v.mmsi = '413000006'
+              AND v.version = (SELECT version FROM vessels WHERE mmsi = '413000006')
+              AND v.status = 'isolated'
             """
         ).fetchone()["c"]
         assert isolated_416 == 1, "late point did not change the earlier verdict"
-        print(f"late point flipped an earlier point: isolated={isolated_416}")
+        print(
+            f"late point flipped an earlier point: v{flipped['version']} isolated={isolated_416}"
+        )
 
         for mmsi in ("413000001", "413000002", "413000003", "413000005", "413000006"):
             row = conn.execute("SELECT * FROM vessels WHERE mmsi = ?", (mmsi,)).fetchone()

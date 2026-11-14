@@ -83,7 +83,12 @@ SZ01,413000001,1767225600,22.500000,114.200000
 * 因此“已提交”即“原档已落盘且判定完整”；失败上传整体回滚并删除该目录，
   既有已发布航迹完全不变。
 * 查询与下载在 `BEGIN`（WAL 快照）内固定船舶 `version`，并发重算不会让一次
-  请求混入新旧两版数据；旧版本在事务内被裁剪。
+  请求混入新旧两版数据；旧版本在事务内被裁剪，但**变更日志（`vessel_versions` /
+  `track_changes`）与游标审计表（`sync_cursors`）永久保留**，是增量同步的事实来源。
+* 每次重算先对新旧可信航迹做 diff：仅当航迹实际变化时铸造新版本并写入整版 `add`/`remove`
+  变更，变更与航迹覆盖在同一事务内提交，因此失败上传不会产生任何可见变化。
+* 游标为自描述 HMAC 令牌（密钥 `data/cursor.key`，0600 权限、首用时生成并 fsync），
+  重启后仍可验签续读；篡改或跨船使用游标返回 400。
 * 启动时 `cleanup_staging` 清理崩溃遗留的 `.staging-*` 和无批次引用的目录，
   已发布批次永不删除。
 
@@ -95,27 +100,72 @@ SZ01,413000001,1767225600,22.500000,114.200000
 | `POST /upload` | 上传原档（multipart 字段名 `file`） |
 | `GET /batches/{id}` | 本批原始行逐行判定 + 解析拒绝明细 |
 | `GET /batches/{id}/original.csv` | 下载该批原档（响应头 `X-Content-SHA256`） |
-| `GET /vessels/{mmsi}` | 可信点（含相对上一点航速）与隔离原因 |
-| `GET /vessels/{mmsi}/track.csv` | 可信航迹 CSV（按 UTC 排序） |
+| `GET /vessels/{mmsi}` | 可信点（含相对上一点航速）、隔离原因与增量同步入口 |
+| `GET /vessels/{mmsi}/track.csv` | 可信航迹 CSV（按 UTC 排序），响应头 `X-Sync-Cursor` 给出与内容绑定的游标 |
 | `GET /vessels/{mmsi}/isolated.csv` | 隔离记录与原因 CSV |
+| `GET /vessels/{mmsi}/cursor` | 取当前航迹对应的游标（JSON） |
+| `GET /vessels/{mmsi}/sync` | 增量变更：按版本返回 `add`/`remove`，网页（Accept: text/html）或 CSV |
 | `GET /healthz` | 健康检查 |
+
+## 增量同步（游标与变更日志）
+
+离线分析库不必在每次迟到电文后重下整船：
+
+1. **全量取游标**：下载 `track.csv`（或打开船舶页、调 `/cursor`）即得到与该航迹内容绑定的
+   不透明游标，形如 `NDEzMDAwMDAxOjE.xxxx`（`<mmsi>:<版本>` 的 HMAC 签名，密钥存于
+   `data/cursor.key`，重启后仍可验签）。
+2. **逐版续读**：`GET /vessels/{mmsi}/sync?cursor=<游标>&limit=N` 返回游标之后的新版本。
+   每个版本对应一次重判、来源于一个批次；**分页以版本为最小单位，一版变化绝不会被拆到两页**，
+   `limit` 限制的是版本数而非行数。
+3. **按序应用**：变更只有两种操作——`add`（新增/重发的可信点）与 `remove`（撤回的旧点，
+   含同秒冲突隔离、超速隔离及派生速度变化后的重发布）。离线库按返回顺序应用即可重建当前航迹。
+   每条变更都带 `source_batch_id/sha256`（触发重判的批次）与 `point_batch_id`（点本身的来源批次）。
+4. **续读与无变化**：响应头 `X-Sync-Next-Cursor` 给出下一游标，`X-Sync-Has-More` 指示是否
+   还有后续；没有新版本时返回空变更且下一游标与当前相同。重算结果与现航迹一致的批次
+   （如重复电文）**不铸造版本、不写变更**，旧游标天然保持最新。
+5. **无游标历史**：不带 `cursor` 调用返回从 v0 起的完整变更历史（首版全为 `add`），
+   可在空库上逐点重建当前航迹。
+6. **并发与重启**：变更与新航迹在同一个 `BEGIN IMMEDIATE` 事务内提交，失败上传不留任何变更；
+   并发上传各自串行成独立版本，游标不会跳过版本；变更日志与游标审计表持久化在 SQLite 中，
+   服务重启后旧游标照常续读。
+
+同步 CSV 列：`version, seq, op, utc_seconds, lat, lon, speed_knots, station, raw_row_id,
+point_batch_id, source_batch_id, source_batch_filename, source_batch_sha256`。
+浏览器直接打开同步 URL 得到网页版变更视图；程序客户端（默认 `Accept: */*`）得到 CSV。
+
+### 同步流程示例
+
+```bash
+# 1) 全量下载，拿到游标
+curl -sD - -o /tmp/track.csv http://127.0.0.1:8000/vessels/413000006/track.csv | grep X-Sync-Cursor
+# X-Sync-Cursor: NDEz...
+
+# 2) 之后有新批次发布，用游标拉增量（每页一版，确保整版原子可见）
+curl -sD - "http://127.0.0.1:8000/vessels/413000006/sync?cursor=<游标>&limit=1"
+
+# 3) 响应头 X-Sync-Has-More: 1 时，用 X-Sync-Next-Cursor 继续；为 0 即已最新
+```
 
 ## 测试与样例
 
 ```bash
 . .venv/bin/activate
-pytest -q            # 规则 + HTTP/并发/重启/失败回滚
-python tests/smoke.py  # 用 samples/ 跑一遍并打印每船判定
+pytest -q            # 规则 + HTTP/并发/重启/失败回滚 + 增量同步（游标/撤回/分页/重启）
+python tests/smoke.py  # 用 samples/ 跑一遍并打印每船判定与增量变更
 ```
 
-`samples/README.md` 详细说明了三个样例场景。手工验证顺序：
+`samples/README.md` 详细说明了样例场景。手工验证顺序：
 
 1. 上传 `samples/batch1_base.csv`：413000001 出现 `duplicate`，413000002 整秒
    `conflict`，413000003 出现 `speed_exceeded`，413000004 的坏行进入拒绝明细。
 2. 上传 `samples/batch2_late_arrivals.csv`：413000005 补入迟到点后被重算，
    413000001/413000002 的重投结果保持稳定，同时出现新船 413000008。
-3. 对比每次上传后 `/vessels/{mmsi}` 与 `track.csv`：413000006 在批次 2 后其
-   01:00 的旧点变为隔离；同时旧批次原档仍可完整下载。
+3. 在 `/vessels/413000006` 复制游标，或从 `track.csv` 响应头取 `X-Sync-Cursor`；
+   对比上传前后的航迹：413000006 在批次 2 后其 01:00 的旧点变为隔离。
+4. 上传 `samples/batch3_incremental.csv`：用旧游标访问
+   `/vessels/413000006/sync?cursor=<游标>` 可看到一版纯 `add`；再传一次同一文件，
+   页面版本号与变更日志均不变化（无变化批次）。`tests/smoke.py` 还会构造冲突批次，
+   演示 `remove` 撤回旧点，并校验按序应用变更可还原当前航迹。
 
 ## 目录
 
@@ -123,9 +173,9 @@ python tests/smoke.py  # 用 samples/ 跑一遍并打印每船判定
 app/
   ais.py        CSV 解析、校验、纯函数航迹判定
   db.py         SQLite schema、WAL 连接、读写事务
-  store.py      原档原子落盘 + 单事务发布 + 全船重算
-  main.py       FastAPI 路由与 CSV 导出
-  templates/    网页（总览/批次/船舶/错误）
-samples/        重投、冲突、迟到点、坏行样例
-tests/          规则单测、HTTP/并发/重启/回滚测试、smoke
+  store.py      原档原子落盘 + 单事务发布 + 全船重算 + diff 变更日志/游标
+  main.py       FastAPI 路由、CSV 导出与增量同步接口
+  templates/    网页（总览/批次/船舶/同步/错误）
+samples/        重投、冲突、迟到点、坏行、增量同步样例
+tests/          规则单测、HTTP/并发/重启/回滚、增量同步测试、smoke
 ```

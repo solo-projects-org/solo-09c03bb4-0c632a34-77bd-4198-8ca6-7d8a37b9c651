@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}增量同步 · 船舶 {{ feed["mmsi"] }}{% endblock %}
+{% block content %}
+<p><a href="/vessels/{{ feed['mmsi'] }}">← 返回船舶页</a></p>
+<h2>MMSI {{ feed["mmsi"] }} · 增量变更</h2>
+<p>
+  <span class="badge ok">当前版本 v{{ feed["current_version"] }}</span>
+  <span class="muted">本页覆盖 v{{ feed["from_version"] }} → v{{ feed["last_version"] }} ·
+    每版重判的变更完整返回，不跨页拆分</span>
+  {% if feed["has_more"] %}<span class="badge warn">还有后续版本</span>{% endif %}
+</p>
+
+{% if cursor %}
+<p class="muted">请求游标：<code class="cursor">{{ cursor }}</code></p>
+{% else %}
+<p class="muted">未提供游标，从 v0 返回完整变更历史（全部为 <code>add</code>，等价于当前航迹的逐点重建）。</p>
+{% endif %}
+
+<p>
+  下一游标：<code class="cursor">{{ feed["next_cursor"] }}</code>
+</p>
+<p>
+  {% if feed["has_more"] %}
+  <a href="/vessels/{{ feed['mmsi'] }}/sync?cursor={{ feed['next_cursor'] }}&limit={{ limit }}">续读下一版（网页）</a> ·
+  {% endif %}
+  <a href="/vessels/{{ feed['mmsi'] }}/sync?cursor={{ feed['next_cursor'] }}&limit={{ limit }}">下载本位置起的变更 CSV</a> ·
+  <a href="/vessels/{{ feed['mmsi'] }}/track.csv">重新全量下载并取得新游标</a>
+</p>
+
+{% if not feed["revisions"] %}
+<p class="muted">游标之后没有新版本：离线库已是当前航迹。旧游标仍可随时再次续读。</p>
+{% endif %}
+
+{% for rev in feed["revisions"] %}
+<h3>版本 v{{ rev["version"] }} · 来源批次
+  <a href="/batches/{{ rev['batch_id'] }}">{{ rev["batch_filename"] }}</a>
+  <span class="muted">({{ rev["created_at"] }} UTC · {{ rev["changes"]|length }} 条变更 · sha256 {{ rev["batch_sha256"][:12] }}…)</span>
+</h3>
+<div class="scroll">
+<table>
+  <thead>
+    <tr><th class="num">#</th><th>操作</th><th class="num">UTC 秒</th><th>UTC 时间</th>
+        <th class="num">纬度</th><th class="num">经度</th><th class="num">速度 (kn)</th><th>岸站</th>
+        <th class="num">原始行</th><th>点来源批次</th></tr>
+  </thead>
+  <tbody>
+  {% for c in rev["changes"] %}
+    <tr>
+      <td class="num">{{ c["seq"] + 1 }}</td>
+      <td class="op-{{ c['op'] }}">{{ c["op"] }}</td>
+      <td class="num">{{ c["utc"] }}</td>
+      <td>{{ c["utc"]|utc }}</td>
+      <td class="num">{{ "-" if c["lat"] is none else "%.6f"|format(c["lat"]) }}</td>
+      <td class="num">{{ "-" if c["lon"] is none else "%.6f"|format(c["lon"]) }}</td>
+      <td class="num">{{ "-" if c["speed_knots"] is none else "%.1f"|format(c["speed_knots"]) }}</td>
+      <td>{{ c["station"] or "-" }}</td>
+      <td class="num">{{ c["raw_row_id"] if c["raw_row_id"] is not none else "-" }}</td>
+      <td>{% if c["point_batch_id"] %}<a href="/batches/{{ c['point_batch_id'] }}">{{ c["point_batch_id"][:10] }}…</a>{% else %}-{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endfor %}
+{% endblock %}

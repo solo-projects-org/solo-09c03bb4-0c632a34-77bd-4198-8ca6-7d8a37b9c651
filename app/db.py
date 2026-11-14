@@ -100,6 +100,52 @@ CREATE TABLE IF NOT EXISTS verdicts (
     PRIMARY KEY (mmsi, version, raw_row_id)
 );
 CREATE INDEX IF NOT EXISTS verdicts_version ON verdicts(mmsi, version);
+
+/* One row per *recomputation* of a vessel.  A batch only touches vessels it
+   carries rows for; within the publishing transaction every touched vessel
+   gets one new version, and version numbers are per-vessel monotonic. */
+CREATE TABLE IF NOT EXISTS vessel_versions (
+    mmsi        TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    batch_id    TEXT NOT NULL REFERENCES batches(id),
+    change_count INTEGER NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (mmsi, version)
+);
+
+/* Immutable change log.  Applying ``op`` in (mmsi, version, seq) order turns
+   the track as of version N-1 into the track as of version N.  ``add``
+   inserts a point, ``remove`` retracts a previously published point.  The
+   whole version is one atomic unit: a reader pages at version boundaries and
+   never sees half a recomputation. */
+CREATE TABLE IF NOT EXISTS track_changes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    mmsi        TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    seq         INTEGER NOT NULL,
+    op          TEXT NOT NULL CHECK (op IN ('add', 'remove')),
+    utc         INTEGER NOT NULL,
+    lat         REAL,
+    lon         REAL,
+    speed_knots REAL,
+    station     TEXT,
+    batch_id    TEXT NOT NULL,
+    point_batch_id TEXT,
+    raw_row_id  INTEGER,
+    UNIQUE (mmsi, version, seq)
+);
+CREATE INDEX IF NOT EXISTS track_changes_cursor
+    ON track_changes(mmsi, version, seq);
+
+/* Audit of every cursor handed out, so a cursor stays resolvable after a
+   restart and repeated full downloads of the same content reuse one row. */
+CREATE TABLE IF NOT EXISTS sync_cursors (
+    token       TEXT PRIMARY KEY,
+    mmsi        TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sync_cursors_vessel ON sync_cursors(mmsi, version);
 """
 
 

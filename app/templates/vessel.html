@@ -12,6 +12,36 @@
   <a href="/vessels/{{ vessel['mmsi'] }}/track.csv">下载可信航迹 CSV</a> ·
   <a href="/vessels/{{ vessel['mmsi'] }}/isolated.csv">下载隔离清单 CSV</a>
 </p>
+<div class="sync-box">
+  <h3>增量同步</h3>
+  <p class="muted">全量下载可信航迹即得到与内容绑定的游标；此后用游标按版本拉取新增（<code>add</code>）
+    与撤回（<code>remove</code>）的点及来源批次，按序应用即可得到当前航迹。每次重算的变更为一版，不会被分页拆开。</p>
+  <p>
+    当前游标（对应 v{{ version }}）：<code class="cursor">{{ cursor }}</code>
+  </p>
+  <p>
+    <a href="/vessels/{{ vessel['mmsi'] }}/sync?cursor={{ cursor }}">查看该游标之后的变更（网页）</a> ·
+    <a href="/vessels/{{ vessel['mmsi'] }}/sync?cursor={{ cursor }}&limit=1">逐版查看（每页一版）</a> ·
+    <a href="/vessels/{{ vessel['mmsi'] }}/sync?cursor={{ cursor }}&limit=1000">下载变更 CSV</a> ·
+    <a href="/vessels/{{ vessel['mmsi'] }}/sync?limit=1000">下载完整变更历史（无游标，从 v0 起）</a>
+  </p>
+</div>
+{% if revisions %}
+<h3>最近重判版本（变更日志）</h3>
+<table>
+  <thead><tr><th class="num">版本</th><th class="num">变更条数</th><th>来源批次</th><th>发布时间 (UTC)</th></tr></thead>
+  <tbody>
+  {% for r in revisions %}
+    <tr>
+      <td class="num">v{{ r["version"] }}</td>
+      <td class="num">{{ r["change_count"] }}</td>
+      <td><a href="/batches/{{ r['batch_id'] }}">{{ r["batch_filename"] }}</a> <code>{{ r["batch_id"][:10] }}…</code></td>
+      <td>{{ r["created_at"] }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
 <p class="muted">涉及原档批次（可分别下载原档）：
   {% for b in batches %}<a href="/batches/{{ b['id'] }}">{{ b["filename"] }}</a>{% if not loop.last %} · {% endif %}{% endfor %}
 </p>
